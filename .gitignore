@@ -10,6 +10,8 @@ go.work
 go.work.sum
 coverage.txt
 coverage.html
+*.jsonl
+*.jsonl.gz
 
 # CLI build output
 /cmd/sum/sum
