@@ -8,7 +8,7 @@
 //
 // Usage:
 //
-//	go run main.go -in raw-wiktextract-data.jsonl -wordlist en_50k.txt -out dictionary.json
+// go run ./cmd/datasetbuild -in data/raw-wiktextract-data.jsonl -wordlist data/en_50k.txt -out dataset/dictionary.json.gz
 package main
 
 import (
@@ -146,7 +146,26 @@ func main() {
 	inPath := flag.String("in", "raw-wiktextract-data.jsonl", "path to the decompressed raw wiktextract JSONL dump")
 	outPath := flag.String("out", "dictionary.json.gz", "where to write the full generated dictionary, gzip-compressed")
 	wordlistPath := flag.String("wordlist", "en_50k.txt", "path to a plain text file, one word per line or 'word count' per line (e.g. en_50k.txt)")
+	lockPath := flag.String("lockfile", "source.lock", "path to source.lock")
+	generateLock := flag.Bool("generate-lock", false, "hash -in and write/update source.lock, then exit")
+	sourceURL := flag.String("source-url", "https://kaikki.org/dictionary/rawdata.html", "URL the dump was downloaded from")
+	skipVerify := flag.Bool("skip-verify", false, "skip source.lock verification (not recommended)")
+
 	flag.Parse()
+
+	if *generateLock {
+		if err := GenerateLock(*inPath, *sourceURL, *lockPath); err != nil {
+			log.Fatalf("generate-lock: %v", err)
+		}
+		return
+	}
+
+	if !*skipVerify {
+		if err := VerifyLock(*inPath, *lockPath); err != nil {
+			log.Fatalf("source.lock verification failed: %v\n"+
+				"(pass -skip-verify to bypass, not recommended for production builds)", err)
+		}
+	}
 
 	wordlist, err := loadWordlist(*wordlistPath)
 	if err != nil {
