@@ -147,6 +147,88 @@ func TestExtractExample(t *testing.T) {
 	}
 }
 
+// ---- extractPhonetics ----
+// Phonetics are word-scoped, not etymology-scoped: an empirical check
+// against the 50k-word wordlist found that wiktextract duplicates the
+// same sounds[] array across etymology sections in 85.2% of
+// multi-etymology words (3,507 of 4,115) rather than genuinely scoping
+// pronunciation per meaning. extractPhonetics is therefore called once
+// per word, over ALL of that word's raw entries — not per etymology
+// group like toVariant — and is tested independently here.
+
+func TestExtractPhonetics_DialectMapping(t *testing.T) {
+	entries := []rawEntry{
+		{
+			Pos: "noun",
+			Sounds: []rawSound{
+				{IPA: "/dɪkʃəˌnɛri/", Tags: []string{"General-American"}},
+				{IPA: "/dɪkʃənri/", Tags: []string{"Received-Pronunciation"}},
+				{IPA: "/ɖɪkʃ(ə)nəri/", Tags: []string{"South-Asia"}},
+			},
+			Senses: []rawSense{
+				{Glosses: []string{"a reference work"}},
+			},
+		},
+	}
+
+	uk, us, other := extractPhonetics(entries)
+
+	assert.Equal(t, "/dɪkʃəˌnɛri/", us, "General-American should map to US")
+	assert.Equal(t, "/dɪkʃənri/", uk, "Received-Pronunciation should map to UK")
+	assert.Equal(t, "/ɖɪkʃ(ə)nəri/", other, "South-Asia is neither UK nor US")
+}
+
+func TestExtractPhonetics_AggregatesAcrossAllEntries(t *testing.T) {
+	// Mirrors the real cross-etymology bleed finding: sounds[] can be
+	// spread across multiple raw entries for the same word (e.g. one per
+	// etymology_number/pos combination). extractPhonetics must be called
+	// with ALL of a word's entries, not just one etymology group, since
+	// phonetics is modeled as word-scoped, not etymology-scoped.
+	entries := []rawEntry{
+		{Pos: "noun", EtymologyNumber: "1", Sounds: []rawSound{{IPA: "/beɪ/", Tags: []string{"US"}}}},
+		{Pos: "adj", EtymologyNumber: "2", Sounds: []rawSound{{IPA: "/beɪ/", Tags: []string{"UK"}}}},
+	}
+
+	uk, us, other := extractPhonetics(entries)
+
+	assert.Equal(t, "/beɪ/", us)
+	assert.Equal(t, "/beɪ/", uk)
+	assert.Equal(t, "", other)
+}
+
+func TestExtractPhonetics_FirstInSourceOrderWinsPerDialect(t *testing.T) {
+	// Documents the deliberate simplification: when multiple sounds share
+	// the same dialect tag, only the first one encountered is kept. This
+	// is stable across rebuilds of the same pinned dump (see source.lock)
+	// but does mean a second, equally valid same-dialect transcription is
+	// discarded.
+	entries := []rawEntry{
+		{
+			Pos: "noun",
+			Sounds: []rawSound{
+				{IPA: "/fɜːrst/", Tags: []string{"US"}},
+				{IPA: "/sɛkənd/", Tags: []string{"US"}},
+			},
+		},
+	}
+
+	_, us, _ := extractPhonetics(entries)
+
+	assert.Equal(t, "/fɜːrst/", us, "the first US-tagged sound in source order should win")
+}
+
+func TestExtractPhonetics_NoSounds(t *testing.T) {
+	entries := []rawEntry{
+		{Pos: "noun", Senses: []rawSense{{Glosses: []string{"a sense with no sounds"}}}},
+	}
+
+	uk, us, other := extractPhonetics(entries)
+
+	assert.Empty(t, uk)
+	assert.Empty(t, us)
+	assert.Empty(t, other)
+}
+
 // ---- toVariant ----
 
 func rawExample(text, exType string) json.RawMessage {
@@ -158,7 +240,7 @@ func rawExample(text, exType string) json.RawMessage {
 	return b
 }
 
-func TestToVariant_DedupsByGloss(t *testing.T) {
+func TestToVariant_DedupsByPosAndGloss(t *testing.T) {
 	// Mirrors the real "head" bug: the same gloss repeated across many
 	// senses, one per citation, must collapse into a single Definition.
 	entries := []rawEntry{
@@ -174,8 +256,31 @@ func TestToVariant_DedupsByGloss(t *testing.T) {
 
 	v := toVariant(entries)
 
-	require.Len(t, v.Definitions, 2, "definitions should be deduped by gloss")
+	require.Len(t, v.Definitions, 2, "definitions should be deduped by pos+gloss")
 	assert.Equal(t, 2, v.SenseCount)
+}
+
+func TestToVariant_SameGlossDifferentPosAreNotCollapsed(t *testing.T) {
+	// Covers the real pos-collision finding: 434 word/etymology groups in
+	// the 50k-word wordlist had identical gloss text across DIFFERENT
+	// parts of speech within the same etymology (e.g. "3rd" as an
+	// abbreviated adjective vs. verb). Deduping on gloss alone would
+	// silently drop one of these; the key must include partOfSpeech.
+	entries := []rawEntry{
+		{Pos: "adj", Senses: []rawSense{{Glosses: []string{"abbreviation of third."}}}},
+		{Pos: "verb", Senses: []rawSense{{Glosses: []string{"abbreviation of third."}}}},
+	}
+
+	v := toVariant(entries)
+
+	require.Len(t, v.Definitions, 2, "same gloss with different pos must both be kept")
+	assert.Equal(t, 2, v.SenseCount)
+
+	var gotPos []string
+	for _, d := range v.Definitions {
+		gotPos = append(gotPos, d.PartOfSpeech)
+	}
+	assert.ElementsMatch(t, []string{"adj", "verb"}, gotPos)
 }
 
 func TestToVariant_PrefersExampleTypeOverQuotation(t *testing.T) {
@@ -204,28 +309,6 @@ func TestToVariant_PrefersExampleTypeOverQuotation(t *testing.T) {
 
 	assert.Contains(t, v.Definitions[0].Examples, "a short modern example",
 		"the type=example sentence should be preferred and included")
-}
-
-func TestToVariant_PhoneticDialectExtraction(t *testing.T) {
-	entries := []rawEntry{
-		{
-			Pos: "noun",
-			Sounds: []rawSound{
-				{IPA: "/dɪkʃəˌnɛri/", Tags: []string{"General-American"}},
-				{IPA: "/dɪkʃənri/", Tags: []string{"Received-Pronunciation"}},
-				{IPA: "/ɖɪkʃ(ə)nəri/", Tags: []string{"South-Asia"}},
-			},
-			Senses: []rawSense{
-				{Glosses: []string{"a reference work"}},
-			},
-		},
-	}
-
-	v := toVariant(entries)
-
-	assert.Equal(t, "/dɪkʃəˌnɛri/", v.PhoneticUS, "General-American should map to US")
-	assert.Equal(t, "/dɪkʃənri/", v.PhoneticUK, "Received-Pronunciation should map to UK")
-	assert.Equal(t, "/ɖɪkʃ(ə)nəri/", v.PhoneticOther, "South-Asia is neither UK nor US")
 }
 
 func TestToVariant_ExcludesSensitiveSenses(t *testing.T) {
