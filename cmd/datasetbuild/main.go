@@ -105,17 +105,17 @@ type Definition struct {
 }
 
 type Variant struct {
-	Etymology     string       `json:"etymology,omitempty"`
-	PhoneticUK    string       `json:"phoneticUK,omitempty"`
-	PhoneticUS    string       `json:"phoneticUS,omitempty"`
-	PhoneticOther string       `json:"phoneticOther,omitempty"`
-	Definitions   []Definition `json:"definitions"`
-	SenseCount    int          `json:"senseCount"`
+	Etymology   string       `json:"etymology,omitempty"`
+	Definitions []Definition `json:"definitions"`
+	SenseCount  int          `json:"senseCount"`
 }
 
 type Entry struct {
-	Word     string    `json:"word"`
-	Variants []Variant `json:"variants"`
+	Word          string    `json:"word"`
+	Variants      []Variant `json:"variants"`
+	PhoneticUK    string    `json:"phoneticUK,omitempty"`
+	PhoneticUS    string    `json:"phoneticUS,omitempty"`
+	PhoneticOther string    `json:"phoneticOther,omitempty"`
 }
 
 // sensitiveTagSet lists sense-level tags that exclude a sense from the
@@ -222,6 +222,18 @@ func main() {
 		rawVariants := wordGroups[word]
 		entry := Entry{Word: word}
 
+		// Phonetics are word-scoped, not etymology-scoped. An empirical
+		// check against the 50k-word wordlist found that wiktextract
+		// duplicates the identical sounds[] array across etymology
+		// sections in 85.2% of multi-etymology words (3,507 of 4,115) —
+		// it does not reliably scope pronunciation per meaning. Treating
+		// PhoneticUK/US/Other as etymology-specific would therefore
+		// misattribute a dialect transcription to the wrong sense in the
+		// large majority of cases it applies to at all. See
+		// extractPhonetics and the trade-off document for the full
+		// finding.
+		entry.PhoneticUK, entry.PhoneticUS, entry.PhoneticOther = extractPhonetics(rawVariants)
+
 		// Group by etymology_number, NOT by pos. Wiktionary sections
 		// pages by etymology: entries that share an etymology_number
 		// (including all being empty, i.e. the word has only one
@@ -299,22 +311,65 @@ func processLine(line string) (rawEntry, bool) {
 	return e, true
 }
 
+// extractPhonetics scans ALL raw entries for a word (across every
+// etymology_number, not just one group) and returns the word-level
+// PhoneticUK/US/Other. This is intentionally NOT scoped per etymology:
+// an empirical check against the 50k-word wordlist found that wiktextract
+// duplicates the same sounds[] array across etymology sections in 85.2%
+// of multi-etymology words (3,507 of 4,115) rather than genuinely scoping
+// pronunciation per meaning — so treating PhoneticUK/US/Other as
+// etymology-specific would misattribute dialect data to the wrong sense
+// in the large majority of cases. Modeling phonetics on Entry instead of
+// Variant reflects what the source data actually supports.
+//
+// Dialect matching: UK = "UK", "Received-Pronunciation", "British";
+// US = "US", "General-American". Everything else falls into
+// PhoneticOther. When multiple sounds share a dialect, the first one
+// encountered in source order wins — a deliberate simplification, stable
+// across rebuilds of the same pinned dump (see source.lock).
+func extractPhonetics(entries []rawEntry) (phoneticUK, phoneticUS, phoneticOther string) {
+	for _, e := range entries {
+		for _, s := range e.Sounds {
+			if s.IPA == "" {
+				continue
+			}
+			tagged := false
+			for _, t := range s.Tags {
+				switch t {
+				case "US", "General-American":
+					if phoneticUS == "" {
+						phoneticUS = s.IPA
+					}
+					tagged = true
+				case "UK", "Received-Pronunciation", "British":
+					if phoneticUK == "" {
+						phoneticUK = s.IPA
+					}
+					tagged = true
+				}
+			}
+			if !tagged && phoneticOther == "" {
+				phoneticOther = s.IPA
+			}
+		}
+	}
+	return phoneticUK, phoneticUS, phoneticOther
+}
+
 // toVariant converts a group of raw wiktextract entries that share the
-// same etymology_number into a single Variant.
+// same etymology_number into a single Variant. Phonetics are handled
+// separately, at word scope, by extractPhonetics — see that function's
+// comment for why.
 //
-// Dialect extraction is a first-pass rule (UK/US/Other), based on real
-// tag-frequency data: UK = "UK", "Received-Pronunciation", "British";
-// US = "US", "General-American". Everything else (Australian, Canada,
-// Scotland, register qualifiers, etc.) falls into PhoneticOther as a
-// single value — a multi-dialect map was considered and rejected as
-// out of scope (only UK/US were required).
-//
-// Definitions are deduplicated by gloss text across all entries in the
-// group, because real entries (e.g. "head") repeat the identical gloss
-// across many senses — one per citation — rather than nesting multiple
-// citations under one sense. Within each gloss group, examples of type
-// "example" are preferred over type "quotation", deduplicated by exact
-// text, capped at 5.
+// Definitions are deduplicated by partOfSpeech + gloss text together
+// across all entries in the group, because real entries (e.g. "head")
+// repeat the identical gloss across many senses — one per citation —
+// rather than nesting multiple citations under one sense, and because a
+// single Variant can mix multiple parts of speech (grouped by etymology,
+// not by pos), so two senses can legitimately share identical gloss text
+// while being genuinely different senses. Within each group, examples of
+// type "example" are preferred over type "quotation", deduplicated by
+// exact text, capped at 5.
 //
 // Senses tagged with a sensitiveTagSet entry are excluded entirely.
 func toVariant(entries []rawEntry) Variant {
@@ -333,29 +388,6 @@ func toVariant(entries []rawEntry) Variant {
 		if v.Etymology == "" && e.EtymologyText != "" {
 			v.Etymology = cleanEtymologyText(e.EtymologyText)
 		}
-		for _, s := range e.Sounds {
-			if s.IPA == "" {
-				continue
-			}
-			tagged := false
-			for _, t := range s.Tags {
-				switch t {
-				case "US", "General-American":
-					if v.PhoneticUS == "" {
-						v.PhoneticUS = s.IPA
-					}
-					tagged = true
-				case "UK", "Received-Pronunciation", "British":
-					if v.PhoneticUK == "" {
-						v.PhoneticUK = s.IPA
-					}
-					tagged = true
-				}
-			}
-			if !tagged && v.PhoneticOther == "" {
-				v.PhoneticOther = s.IPA
-			}
-		}
 
 		for _, s := range e.Senses {
 			if len(s.Glosses) == 0 {
@@ -365,7 +397,7 @@ func toVariant(entries []rawEntry) Variant {
 				continue
 			}
 			gloss := s.Glosses[0]
-			key := strings.ToLower(strings.TrimSpace(gloss))
+			key := strings.ToLower(strings.TrimSpace(e.Pos)) + "|" + strings.ToLower(strings.TrimSpace(gloss))
 			if key == "" {
 				continue
 			}
