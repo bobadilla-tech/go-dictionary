@@ -14,6 +14,10 @@ Wiktionary-derived dataset.
 - **Compressed embedded data**: the generated dataset is stored as
   gzip-compressed JSON to reduce binary size
 
+- **Reproducible builds**: the raw dump used to generate the dataset is
+  pinned by hash in `source.lock` — see [Regenerating the
+  Dataset](#regenerating-the-dataset)
+
 - **Rich, unopinionated shape**: the dataset exposes multiple etymologies per
   word (`Variant`), multiple dialects (UK/US/Other), and multiple examples per
   sense — this package does not collapse or select among them; see
@@ -28,9 +32,9 @@ Wiktionary-derived dataset.
 - **Case-insensitive lookups**: input is normalized to lowercase before
   lookup
 
-- **Well tested**: dataset-generation logic (deduplication, dialect
-  extraction, sensitive-content filtering, etymology-text cleanup) is covered
-  by unit tests in `cmd/datasetbuild`
+- **Well tested**: dataset-generation logic (deduplication, phonetics
+  extraction, sensitive-content filtering, etymology-text cleanup) is
+  covered by unit tests in `cmd/datasetbuild`
 
 ## Installation
 
@@ -55,6 +59,8 @@ func main() {
 	if !ok {
 		log.Fatal("word not found")
 	}
+
+	fmt.Println("UK:", entry.PhoneticUK, "US:", entry.PhoneticUS)
 
 	for _, variant := range entry.Variants {
 		fmt.Println("Etymology:", variant.Etymology)
@@ -83,17 +89,17 @@ word isn't in the dataset.
 
 ```go
 type Entry struct {
-	Word     string
-	Variants []Variant
-}
-
-type Variant struct {
-	Etymology     string       // readable prose, cleaned of generated noise — see How It Works
+	Word          string
 	PhoneticUK    string       // empty if no UK-tagged pronunciation was found
 	PhoneticUS    string       // empty if no US-tagged pronunciation was found
 	PhoneticOther string       // first non-UK/US IPA found, if any — see Known Limitations
-	Definitions   []Definition
-	SenseCount    int          // len(Definitions) — a signal for callers choosing among Variants
+	Variants      []Variant
+}
+
+type Variant struct {
+	Etymology   string       // readable prose, cleaned of generated noise — see How It Works
+	Definitions []Definition
+	SenseCount  int          // len(Definitions) — a signal for callers choosing among Variants
 }
 
 type Definition struct {
@@ -102,6 +108,12 @@ type Definition struct {
 	Examples     []string // 0 to 5 example sentences, deduplicated
 }
 ```
+
+`PhoneticUK`/`PhoneticUS`/`PhoneticOther` live on `Entry`, not on `Variant` —
+they describe the word's pronunciation as a whole, not one specific to a
+given etymology. This is deliberate, not an oversight: see [How It
+Works](#how-it-works) for why the source data doesn't reliably support
+scoping pronunciation to a single etymology.
 
 Most words have exactly one `Variant`. More than one means a genuine
 homograph with unrelated etymologies — e.g. `"name"` (the identifier), `"name"`
@@ -180,11 +192,50 @@ matched its actual content:
   vs. "name" the yam) produces a separate `Variant`, never merged into the
   other, even when they share a part of speech.
 
-- **Definitions are deduplicated by gloss text.** Some real entries (e.g.
-  "head") repeat the identical definition text across many raw senses — one
-  per citation — rather than nesting multiple citations under a single
-  sense. Those are collapsed into one `Definition`, keeping up to 5 example
-  sentences, deduplicated by exact text.
+- **Phonetics are extracted once per word, across every etymology group —
+  not once per `Variant`.** An empirical check found wiktextract duplicates
+  the identical `sounds[]` array across etymology sections in 85.2% of
+  multi-etymology words (3,507 of 4,115 in the wordlist-filtered corpus)
+  rather than genuinely scoping pronunciation per meaning — first noticed
+  on `"name"`, where the yam etymology carried a UK pronunciation that
+  actually belongs to the identifier etymology. Attaching phonetics to
+  `Variant` would therefore misattribute a dialect transcription to the
+  wrong sense far more often than it would correctly attribute it, so
+  `PhoneticUK`/`PhoneticUS`/`PhoneticOther` are extracted at word scope
+  onto `Entry` instead, aggregating `sounds[]` across all of a word's raw
+  entries. When multiple sounds share a dialect, the first one encountered
+  in source order wins — deterministic and stable across rebuilds of the
+  same pinned dump, since the input is fixed by `source.lock`.
+
+- **UK/US dialect tags were mapped from real frequency data, not
+  assumption.** An inventory pass over `sounds[].tags` across the
+  wordlist-filtered corpus showed the tags `General-American` and
+  `Received-Pronunciation`/`British` carried far more volume than the bare
+  `US`/`UK` tags alone — both are now recognized. Everything else
+  (Australian, Canadian, Scottish, register qualifiers like "dialectal" or
+  "archaic", etc.) falls into `PhoneticOther` as a single value; a
+  multi-dialect map was considered and explicitly rejected as out of
+  scope — only UK/US were required.
+
+- **Definitions are deduplicated by part of speech + gloss text
+  together, not gloss alone.** Some real entries (e.g. "head") repeat the
+  identical definition text across many raw senses — one per citation —
+  rather than nesting multiple citations under a single sense; those
+  collapse into one `Definition`, keeping up to 5 example sentences,
+  deduplicated by exact text. But a single `Variant` can also mix multiple
+  parts of speech (grouping is by etymology, not by pos — see above), so
+  two senses can legitimately share identical gloss text while being
+  genuinely different senses (e.g. `"3rd"` as an abbreviated adjective vs.
+  verb). An empirical check found 434 such word/etymology groups in the
+  50k-word wordlist (out of 37,357 matched words) — deduplicating on gloss
+  alone would have silently dropped one of the two. Sense-level tags
+  (e.g. `dialectal`, `obsolete`) are not part of the dedup key: a check of
+  same-pos/same-gloss senses with differing tags found the large majority
+  are grammatical-usage tags (`countable`/`uncountable`,
+  `transitive`/`intransitive`) that the source records once per valid
+  usage combination rather than as genuinely distinct senses, so including
+  tags in the key would reintroduce far more false "duplicates" than
+  distinctions preserved.
 
 - **Example sentences of type `"example"` are preferred over
   `"quotation"`** when both exist for the same sense — short illustrative
@@ -198,16 +249,6 @@ matched its actual content:
   sentence in between is kept. This is a best-effort heuristic based on
   patterns observed in real entries, not a guaranteed parse of every
   possible etymology format.
-
-- **UK/US dialect tags were mapped from real frequency data, not
-  assumption.** An inventory pass over `sounds[].tags` across the
-  wordlist-filtered corpus showed the tags `General-American` and
-  `Received-Pronunciation`/`British` carried far more volume than the bare
-  `US`/`UK` tags alone — both are now recognized. Everything else
-  (Australian, Canadian, Scottish, register qualifiers like "dialectal" or
-  "archaic", etc.) falls into `PhoneticOther` as a single value; a
-  multi-dialect map was considered and explicitly rejected as out of
-  scope — only UK/US were required.
 
 - **Senses tagged `vulgar`, `derogatory`, `offensive`, or `slur` are
   excluded.** These four were chosen from real tag-frequency data as the
@@ -231,13 +272,25 @@ matched its actual content:
   does not distinguish "no dialect tag at all" from "a real third dialect
   (e.g. Australian) that wasn't specifically requested." Both land in the
   same field.
-- **`sounds[]` can bleed across etymologies in the source data.** For words
-  with multiple etymologies, wiktextract sometimes replicates the full
-  pronunciation list across etymology sections rather than scoping each
-  dialect tag to the section it belongs to. This was observed with
-  `"name"`, where the yam etymology's `Variant` shows a UK pronunciation
-  that actually belongs to the identifier etymology. Not corrected — an
-  accepted data-source limitation rather than an unverified heuristic fix.
+- **Phonetics are word-scoped, not etymology-scoped, so they cannot be
+  attributed to a specific `Variant`.** As covered in [How It
+  Works](#how-it-works), the source data does not reliably scope
+  pronunciation per etymology (85.2% of multi-etymology words duplicate
+  the same `sounds[]` across etymology sections), so `PhoneticUK`/`US`/
+  `Other` live on `Entry` rather than per-`Variant`. The trade-off this
+  accepts: a genuinely different etymology with its own distinct
+  pronunciation, on the rare occasions the source does provide that
+  distinction cleanly, is not preserved separately — a caller cannot infer
+  which etymology/sense a given phonetic value "belongs to."
+- **Sense-level tags (dialectal, obsolete, archaic, etc.) are not
+  reflected in the response.** Two senses with the same part of speech and
+  gloss but different tags collapse into one `Definition`, merging their
+  examples. This was a deliberate choice after empirical review found most
+  same-gloss/same-pos tag differences are grammatical-usage variants
+  (`countable`/`uncountable`), not distinct meanings — see [How It
+  Works](#how-it-works). A smaller subset of genuinely distinct
+  regional/register senses (e.g. `UK` vs. `Canada`/`US`,
+  `dialectal`/`obsolete`) is merged away as a result.
 - **The sensitive-content filter only catches what Wiktionary tagged
   explicitly.** Coverage depends on how consistently the source tagged a
   given sense; some sensitive senses without one of the four filtered tags
@@ -252,6 +305,9 @@ matched its actual content:
 go-dictionary/
 ├── data.go                    ← package source (this file's home), go:embed directives live here
 ├── go.mod
+├── source.lock                ← pins the raw dump used to generate dictionary.json.gz:
+│                                  source URL, fetch timestamp, SHA-256 — see Regenerating
+│                                  the Dataset
 ├── dataset/                   ← EMBEDDED via go:embed — consumed at runtime
 │   ├── curated.json           ← hand-curated dataset (renamed from words.json)
 │   └── dictionary.json.gz     ← generated Wiktionary-derived dataset
@@ -261,6 +317,7 @@ go-dictionary/
 └── cmd/
     └── datasetbuild/          ← the generator that produces dataset/dictionary.json.gz
         ├── main.go
+        ├── lock.go            ← source.lock generation/verification (-generate-lock, -skip-verify)
         └── main_test.go
 ```
 
@@ -271,12 +328,34 @@ already-processed outputs the compiled binary actually embeds.
 
 ## Regenerating the Dataset
 
+The raw dump is pinned by `source.lock` (source URL, fetch timestamp,
+SHA-256) so builds are reproducible and a mismatched or stale dump is
+caught before it silently produces a different dataset. The dump itself
+(~23GB) is not committed — see [Project Layout](#project-layout).
+
+**First time, or after intentionally updating to a newer dump:**
+
+```bash
+go run ./cmd/datasetbuild -in data/raw-wiktextract-data.jsonl -generate-lock
+```
+
+This hashes the dump and writes/updates `source.lock`. Commit `source.lock`
+(not the dump) after running this.
+
+**Normal build**, verifying the dump against `source.lock` before
+generating anything:
+
 ```bash
 go run ./cmd/datasetbuild \
   -in data/raw-wiktextract-data.jsonl \
   -wordlist data/en_50k.txt \
   -out dataset/dictionary.json.gz
 ```
+
+If the dump's hash doesn't match `source.lock`, the build aborts with a
+descriptive error instead of generating from an unexpected source. Pass
+`-skip-verify` to bypass this for local experimentation — not recommended
+for reproducible or production builds.
 
 `data/raw-wiktextract-data.jsonl` is the decompressed raw dump from
 [kaikki.org/dictionary/rawdata.html](https://kaikki.org/dictionary/rawdata.html)
@@ -298,9 +377,12 @@ go test -v ./...
 ```
 
 Test coverage focuses on the generator logic in `cmd/datasetbuild` — gloss
-deduplication, example-type preference, dialect-tag extraction, sensitive-tag
-filtering, etymology-text cleanup, and the lowercase acronym guard — since
-that is where the real bugs found during dataset verification lived.
+deduplication (by part of speech + gloss, including the case where
+identical gloss text spans different parts of speech), example-type
+preference, phonetics extraction (word-scoped, aggregating across
+etymology groups), sensitive-tag filtering, etymology-text cleanup, and the
+lowercase acronym guard — since that is where the real bugs found during
+dataset verification lived.
 
 ## Used in Production
 
