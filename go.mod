@@ -1,4 +1,4 @@
-module github.com/bobadilla-tech/go-package
+module github.com/bobadilla-tech/go-dictionary
 
 go 1.25.0
 
