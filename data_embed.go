@@ -7,16 +7,14 @@
 //   - dataset/dictionary.json.gz — the new, much larger Wiktionary-derived
 //     dataset (generated via wiktextract), gzip-compressed.
 //
-// This package is intentionally scoped to DATA ACCESS ONLY. It exposes no
-// Lookup(), no word normalization beyond lowercasing for map keys, and no
-// decision about which source wins when both have an entry for the same
-// word. That precedence decision — curated-first, Wiktionary-fallback,
-// mirroring the pattern already used by thesaurus-go for
-// curated-synonyms-first, OEWN-fallback — belongs in the calling service
-// (apps/api/services/text/words/service.go), not here. This keeps each
-// dataset independently swappable and versionable without carrying
-// lookup semantics tied to one API's response shape. See the companion
-// trade-off analysis document for the full rationale.
+// This package is scoped to data access: it looks words up by
+// lowercased key and returns the raw stored record. The precedence
+// decision for which source wins when both have an entry for the same
+// word — curated-first, Wiktionary-fallback, mirroring the pattern
+// already used by thesaurus-go for curated-synonyms-first, OEWN-fallback
+// — belongs in the calling service (apps/api/services/text/words/service.go).
+// This keeps each dataset independently swappable and versionable, with
+// lookup semantics owned by whichever API shape consumes them
 package dictionarydata
 
 import (
@@ -37,9 +35,8 @@ var dictionaryRaw []byte
 // ---- curated dataset shape (words.json) ----
 
 // CuratedDefinition is one definition entry in the hand-curated dataset.
-// Mirrors the original words/data.go definitionEntry — one phonetic, one
-// example per definition, no etymology/Variant concept, since the
-// curated set never needed to represent homographs.
+// Mirrors the original words/data.go definitionEntry: a part of speech,
+// a definition, and a single example.
 type CuratedDefinition struct {
 	PartOfSpeech string `json:"partOfSpeech"`
 	Definition   string `json:"definition"`
@@ -56,53 +53,69 @@ type CuratedEntry struct {
 
 // ---- Wiktionary-derived dataset shape (dictionary.json.gz) ----
 
-// Definition is one sense within a Variant. PartOfSpeech is kept per
-// definition (not hoisted to Variant level) because a single etymology
-// commonly mixes parts of speech — e.g. "melancholy" (noun + adjective,
-// same origin).
+// Definition is one sense within a Variant: a part of speech, the
+// definition text, and up to several example sentences (Examples). Each
+// Definition carries its own PartOfSpeech because a single etymology
+// commonly spans multiple parts of speech — e.g. "melancholy" (noun and
+// adjective, same origin). The generator deduplicates definitions within
+// a Variant by partOfSpeech + gloss text together, since identical gloss
+// text can legitimately span different parts of speech within the same
+// etymology (e.g. "3rd" as an abbreviated adjective vs. verb).
 type Definition struct {
 	PartOfSpeech string   `json:"partOfSpeech"`
 	Definition   string   `json:"definition"`
 	Examples     []string `json:"examples,omitempty"`
 }
 
-// Variant groups everything that shares a single etymology. Multiple
-// Variants on the same Entry mean genuine homographs with unrelated
-// origins (e.g. "name" the identifier vs. "name" the Caribbean yam,
-// "pond" the body of water vs. the archaic verb "to ponder") — the
-// caller decides how to select or present multiple Variants, this
-// package does not.
+// Variant groups everything that shares a single etymology: the
+// etymology text, its Definitions, and SenseCount (the number of
+// definitions). Multiple Variants on the same Entry represent genuine
+// homographs with unrelated origins — e.g. "name" the identifier vs.
+// "name" the Caribbean yam, "pond" the body of water vs. the archaic
+// verb "to ponder".
+//
+// Phonetic fields live on Entry rather than here — see Entry.PhoneticUK/
+// PhoneticUS/PhoneticOther for why pronunciation is modeled at word
+// scope.
+type Variant struct {
+	Etymology   string       `json:"etymology,omitempty"`
+	Definitions []Definition `json:"definitions"`
+	SenseCount  int          `json:"senseCount"`
+}
+
+// Entry is the full Wiktionary-derived record for one word: a word-level
+// phonetic (PhoneticUK/PhoneticUS/PhoneticOther) plus one or more
+// Variants, one per distinct etymology found in the source. Most words
+// have exactly one Variant.
 //
 // PhoneticUK and PhoneticUS are extracted from a first-pass dialect tag
 // whitelist (UK: "UK"/"Received-Pronunciation"/"British"; US:
-// "US"/"General-American"). PhoneticOther holds the first IPA that
-// didn't match either — this can be either an untagged transcription or
-// a real third dialect (e.g. Australian, Scottish); the two cases are
-// not distinguished, by design (see trade-off document — a full
-// multi-dialect map was out of scope).
+// "US"/"General-American"). PhoneticOther holds the first IPA found that
+// carried a different tag or none at all, covering both untagged
+// transcriptions and real third dialects (e.g. Australian, Scottish)
+// under one field..
 //
-// Known limitation: for words with multiple etymologies, wiktextract
-// sometimes replicates the full sounds[] list across etymology sections
-// rather than scoping each dialect tag to the section it belongs to.
-// This can cause a Variant's phonetic fields to reflect a sibling
-// etymology's pronunciation rather than its own (observed with "name").
-// Not corrected here — treated as a known, accepted data-source
-// limitation rather than papered over with an unverified heuristic.
-type Variant struct {
-	Etymology     string       `json:"etymology,omitempty"`
-	PhoneticUK    string       `json:"phoneticUK,omitempty"`
-	PhoneticUS    string       `json:"phoneticUS,omitempty"`
-	PhoneticOther string       `json:"phoneticOther,omitempty"`
-	Definitions   []Definition `json:"definitions"`
-	SenseCount    int          `json:"senseCount"`
-}
-
-// Entry is the full Wiktionary-derived record for one word: one or more
-// Variants, one per distinct etymology found in the source. Most words
-// have exactly one.
+// Phonetics are modeled at word scope (here, on Entry) rather than per
+// Variant. This reflects an empirical finding: wiktextract duplicates
+// the identical sounds[] array across etymology sections in 85.2% of
+// multi-etymology words (3,507 of 4,115 in the wordlist-filtered
+// corpus) — first observed with "name", where the yam etymology carried
+// a UK pronunciation that actually belongs to the identifier etymology.
+// Given that frequency, the generator aggregates sounds[] across ALL of
+// a word's raw entries (every etymology_number) before assigning
+// PhoneticUK/US/Other, producing one word-level pronunciation set that
+// reflects what the source data reliably supports. See the trade-off
+// document's "Known Trade-offs and Limitations" section for the
+// resulting scope: a genuinely different etymology with its own
+// distinct pronunciation, on the occasions the source does provide that
+// distinction cleanly, is represented by the same word-level fields as
+// its sibling etymologies.
 type Entry struct {
-	Word     string    `json:"word"`
-	Variants []Variant `json:"variants"`
+	Word          string    `json:"word"`
+	PhoneticUK    string    `json:"phoneticUK,omitempty"`
+	PhoneticUS    string    `json:"phoneticUS,omitempty"`
+	PhoneticOther string    `json:"phoneticOther,omitempty"`
+	Variants      []Variant `json:"variants"`
 }
 
 // ---- loading ----
@@ -159,21 +172,18 @@ func loadDictionary() error {
 
 // ---- public accessors ----
 
-// GetCurated returns the hand-curated entry for word (case-insensitive),
-// or false if it's not among the curated set. Pure data access — no
-// normalization beyond lowercasing for lookup.
+// GetCurated returns the hand-curated entry for word (case-insensitive
+// lookup), or false if it's not among the curated set.
 func GetCurated(word string) (CuratedEntry, bool) {
 	e, ok := curatedData[strings.ToLower(word)]
 	return e, ok
 }
 
-// Get returns the Wiktionary-derived entry for word (case-insensitive),
-// or false if the word is not in the dataset. Pure data access — no
-// dialect selection, no Variant collapsing, no precedence over
-// GetCurated. Callers needing a single flattened result, or a decision
-// on which of GetCurated/Get should win for a given word, must build
-// that logic themselves — see the trade-off document for why this
-// responsibility deliberately lives outside this package.
+// Get returns the Wiktionary-derived entry for word (case-insensitive
+// lookup), or false if the word is not in the dataset. It returns the
+// stored record as-is; combining it with GetCurated's result for the
+// same word, or selecting among multiple Variants, is the calling
+// service's responsibility.
 func Get(word string) (Entry, bool) {
 	e, ok := dictionaryData[strings.ToLower(word)]
 	return e, ok
